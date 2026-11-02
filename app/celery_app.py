@@ -1,4 +1,5 @@
-from celery import Celery
+from celery import Celery, signals
+from prometheus_client import start_http_server
 
 from .config import settings
 
@@ -15,3 +16,8 @@ celery.conf.update(
     result_expires=3600,
     broker_connection_retry_on_startup=True,
 )
+
+
+@signals.worker_init.connect
+def on_worker_init(**kwargs):
+    start_http_server(8001)  # worker metrics at :8001/metrics

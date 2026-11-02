@@ -17,3 +17,10 @@ def test_invalid_job_type_is_rejected():
 def test_unknown_job_returns_404():
     r = client.get("/jobs/00000000-0000-0000-0000-000000000000")
     assert r.status_code == 404
+
+
+
+def test_metrics_endpoint_exposed():
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    assert "taskpulse_queue_depth" in r.text

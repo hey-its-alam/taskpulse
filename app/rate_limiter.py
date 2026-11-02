@@ -6,6 +6,7 @@ import redis
 from fastapi import HTTPException, Request, Response
 
 from .config import settings
+from .metrics import RATE_LIMITED
 
 log = logging.getLogger("taskpulse.ratelimit")
 _redis = redis.Redis.from_url(settings.redis_url)
@@ -36,6 +37,7 @@ def rate_limit(scope: str, limit: int, window: Optional[int] = None):
         response.headers["X-RateLimit-Reset"] = str(reset_in)
 
         if count > limit:
+            RATE_LIMITED.labels(scope=scope).inc()
             log.warning("rate limit hit scope=%s client=%s count=%s", scope, client, count)
             raise HTTPException(
                 status_code=429,

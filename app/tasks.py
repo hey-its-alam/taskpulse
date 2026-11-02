@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from .celery_app import celery
 from .config import settings
 from .database import SessionLocal
+from .metrics import ACTIVE_JOBS, JOB_DURATION, JOB_RETRIES, JOBS_PROCESSED
 from .models import Job
 
 log = logging.getLogger("taskpulse.worker")
@@ -33,30 +34,36 @@ def now():
 @celery.task(bind=True, name="run_job", max_retries=3, rate_limit=settings.task_rate_limit)
 def run_job(self, job_id: str):
     db = SessionLocal()
+    started = time.time()
+    job_type = "unknown"
+    ACTIVE_JOBS.inc()
     try:
         job = db.get(Job, uuid.UUID(job_id))
         if job is None:
             log.error("job not found id=%s", job_id)
             return
+        job_type = job.type
         job.status = "running"
         job.started_at = job.started_at or now()
         db.commit()
-        log.info("job started id=%s type=%s attempt=%s", job_id, job.type, self.request.retries + 1)
+        log.info("job started id=%s type=%s attempt=%s", job_id, job_type, self.request.retries + 1)
 
         try:
-            simulate_work(job.type)
+            simulate_work(job_type)
         except Exception as exc:
             if self.request.retries < self.max_retries:
                 job.status = "retrying"
                 job.retries = self.request.retries + 1
                 job.error_message = str(exc)
                 db.commit()
+                JOB_RETRIES.labels(type=job_type).inc()
                 log.warning("job will retry id=%s retry=%s error=%s", job_id, job.retries, exc)
                 raise self.retry(exc=exc, countdown=2 ** (self.request.retries + 1))
             job.status = "failed"
             job.error_message = str(exc)
             job.finished_at = now()
             db.commit()
+            JOBS_PROCESSED.labels(type=job_type, status="failed").inc()
             log.error("job failed permanently id=%s error=%s", job_id, exc)
             return
 
@@ -64,6 +71,9 @@ def run_job(self, job_id: str):
         job.error_message = None
         job.finished_at = now()
         db.commit()
-        log.info("job succeeded id=%s type=%s", job_id, job.type)
+        JOBS_PROCESSED.labels(type=job_type, status="success").inc()
+        log.info("job succeeded id=%s type=%s", job_id, job_type)
     finally:
+        JOB_DURATION.labels(type=job_type).observe(time.time() - started)
+        ACTIVE_JOBS.dec()
         db.close()
