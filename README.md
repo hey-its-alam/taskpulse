@@ -40,7 +40,7 @@ docker compose exec api pytest -q
 Prometheus scrapes metrics from the API (`:8000/metrics`) and the worker (`:8001/metrics`).
 The Grafana dashboard shows queue depth, active jobs, request rate, throughput and jobs by status.
 
-![Dashboard](docs/screenshots/dashboard-v1.png)
+![Dashboard](docs/screenshots/dashboard-v1.png.png)
 
 | Service | URL |
 |---|---|
