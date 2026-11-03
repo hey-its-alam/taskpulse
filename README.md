@@ -43,13 +43,13 @@ docker compose exec api pytest -q
 Prometheus scrapes metrics from the API (`:8000/metrics`) and the worker (`:8001/metrics`).
 The Grafana dashboard shows queue depth, active jobs, request rate, throughput and jobs by status.
 
-![Dashboard](D:\TaskPulse\docs\screenshots\dashboard-v1.png.png)
+![Dashboard](docs/screenshots/dashboard-v1.png)
 
 ### Logs
 Structured JSON logs are shipped to Loki by Grafana Alloy and searched in Grafana Explore.
 This is the full history of one job: submitted, failed three times with exponential backoff, then succeeded.
 
-![Job logs](D:\TaskPulse\docs\screenshots\logs-v1.png)
+![Job logs](docs/screenshots/logs-v1.png)
 
 Useful queries:
 ```
