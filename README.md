@@ -1,6 +1,6 @@
 # TaskPulse
 
-Distributed job processing platform with full observability: metrics, logs and traces.
+Distributed job processing platform with full observability: metrics, logs and traces, linked together in Grafana.
 
 ## Stack
 FastAPI, Celery, Redis, PostgreSQL, Prometheus, Loki, Grafana Alloy, Tempo, OpenTelemetry, Grafana, Docker Compose
@@ -15,6 +15,7 @@ FastAPI, Celery, Redis, PostgreSQL, Prometheus, Loki, Grafana Alloy, Tempo, Open
 - Prometheus metrics and a Grafana dashboard (queue depth, throughput, active jobs)
 - Structured JSON logs shipped to Loki and searchable in Grafana
 - Distributed tracing with OpenTelemetry and Tempo (API, queue, worker and database in one trace)
+- Logs and traces linked by trace ID in Grafana, in both directions
 
 ## Architecture
 ```
@@ -48,6 +49,17 @@ Job types: `generate_report`, `send_email`, `resize_image`.
 | Queue length before HTTP 503 | 500 | `MAX_QUEUE_DEPTH` |
 
 Clients are identified by the `X-API-Key` header, or by IP address if there is no header.
+The limiter is a fixed-window counter in Redis. If Redis is down it fails open, so users are not blocked.
+
+## Configuration
+Set in `.env` (see `.env.example`).
+
+| Variable | Purpose |
+|---|---|
+| `RATE_LIMIT_WINDOW_SECONDS` | Length of the rate limit window |
+| `TASK_RATE_LIMIT` | Worker throttle, for example `120/m` |
+| `FAILURE_RATE` | Share of simulated job failures (for failure testing) |
+| `EXTRA_LATENCY_SECONDS` | Extra delay added to every job (for slowness testing) |
 
 ## Run
 ```
@@ -85,23 +97,32 @@ Useful queries:
 
 ### Traces
 OpenTelemetry traces go to Tempo. One trace follows a job from the API, through the Redis queue, into the worker and the database.
-The API answers in about 57 ms while the job runs in the background, and the trace shows where every millisecond went.
+The API answers in under 100 ms while the job runs in the background, and the trace shows where every millisecond went.
 
 ![Trace](docs/screenshots/trace-v1.png)
 
-To find a trace, copy the `trace_id` from the `POST /jobs` response, open Grafana, go to Explore, choose Tempo, and paste it in the TraceQL tab. Every JSON log line also carries the same `trace_id`.
+To find a trace, copy the `trace_id` from the `POST /jobs` response, open Grafana, go to Explore, choose Tempo, and paste it in the TraceQL tab.
+
+### Logs and traces linked
+Every JSON log line carries the `trace_id` of the request it belongs to, and Grafana links the two in both directions.
+Click **View trace** on a log line to open its trace:
+
+![Log to trace](docs/screenshots/log-to-trace.png)
+
+Click the log icon on a span to see every log line of that trace:
+
+![Trace to logs](docs/screenshots/trace-to-logs.png)
 
 ### Services
 | Service | URL |
 |---|---|
 | API docs | http://localhost:8000/docs |
 | Prometheus | http://localhost:9090 |
-| Grafana | http://localhost:3000 (login `admin` / `admin`, set in `.env`) |
+| Grafana | http://localhost:3000 (default login `admin` / `admin`, set in `.env`) |
 | Loki | http://localhost:3100 |
 | Tempo | http://localhost:3200 |
 
 ## Roadmap
-- Link logs and traces in Grafana (log line to trace and back)
 - Alerts (error rate, queue backlog, failed jobs, worker down)
 - Load tests with k6 and failure simulations
 - Incident report
