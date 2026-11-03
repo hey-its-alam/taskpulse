@@ -1,4 +1,5 @@
 import redis
+from opentelemetry.instrumentation.utils import suppress_instrumentation
 from prometheus_client import Counter, Gauge, Histogram
 from prometheus_client.core import REGISTRY, GaugeMetricFamily
 from sqlalchemy import func, select
@@ -44,8 +45,9 @@ class JobStatusCollector:
     def collect(self):
         family = GaugeMetricFamily("taskpulse_jobs_by_status", "Jobs per status", labels=["status"])
         try:
-            with SessionLocal() as db:
-                rows = db.execute(select(Job.status, func.count()).group_by(Job.status)).all()
+            with suppress_instrumentation():  # keep this query out of the traces
+                with SessionLocal() as db:
+                    rows = db.execute(select(Job.status, func.count()).group_by(Job.status)).all()
             for status, count in rows:
                 family.add_metric([status], count)
         except Exception:

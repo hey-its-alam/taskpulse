@@ -3,6 +3,7 @@ from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from opentelemetry import trace
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -18,6 +19,11 @@ log = logging.getLogger("taskpulse.api")
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 
+def current_trace_id() -> Optional[str]:
+    ctx = trace.get_current_span().get_span_context()
+    return format(ctx.trace_id, "032x") if ctx.is_valid else None
+
+
 @router.post(
     "", response_model=JobOut, status_code=202,
     dependencies=[Depends(rate_limit("submit", settings.rate_limit_submit))],
@@ -28,7 +34,7 @@ def submit_job(body: JobCreate, db: Session = Depends(get_db)):
         BACKPRESSURE.inc()
         raise HTTPException(503, "Queue is full, try again later", headers={"Retry-After": "10"})
 
-    job = Job(type=body.type, payload=body.payload, status="pending")
+    job = Job(type=body.type, payload=body.payload, status="pending", trace_id=current_trace_id())
     db.add(job)
     db.commit()
     db.refresh(job)

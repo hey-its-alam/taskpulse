@@ -28,4 +28,7 @@ def configure_logging(**kwargs):
 
 @signals.worker_init.connect
 def on_worker_init(**kwargs):
+    from .telemetry import setup_tracing
+
+    setup_tracing("taskpulse-worker")
     start_http_server(8001)  # worker metrics at :8001/metrics
