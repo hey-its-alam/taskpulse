@@ -3,7 +3,7 @@
 Distributed job processing platform with full observability.
 
 ## Stack
-FastAPI, Celery, Redis, PostgreSQL, Prometheus, Grafana, Docker Compose
+FastAPI, Celery, Redis, PostgreSQL, Prometheus, Loki, Grafana Alloy, Grafana, Docker Compose
 
 ## Features
 - Submit background jobs over HTTP (202 Accepted)
@@ -13,6 +13,7 @@ FastAPI, Celery, Redis, PostgreSQL, Prometheus, Grafana, Docker Compose
 - Per-client rate limiting (HTTP 429 with Retry-After)
 - Queue backpressure (HTTP 503 when the queue is full)
 - Prometheus metrics and a Grafana dashboard (queue depth, throughput, active jobs)
+- Structured JSON logs shipped to Loki and searchable in Grafana
 
 ## API
 | Method | Endpoint | Purpose |
@@ -37,10 +38,24 @@ docker compose exec api pytest -q
 ```
 
 ## Observability
+
+### Metrics
 Prometheus scrapes metrics from the API (`:8000/metrics`) and the worker (`:8001/metrics`).
 The Grafana dashboard shows queue depth, active jobs, request rate, throughput and jobs by status.
 
-![Dashboard](docs/screenshots/dashboard-v1.png.png)
+![Dashboard](D:\TaskPulse\docs\screenshots\dashboard-v1.png.png)
+
+### Logs
+Structured JSON logs are shipped to Loki by Grafana Alloy and searched in Grafana Explore.
+This is the full history of one job: submitted, failed three times with exponential backoff, then succeeded.
+
+![Job logs](D:\TaskPulse\docs\screenshots\logs-v1.png)
+
+Useful queries:
+```
+{service="worker"} | json | level="WARNING"
+{service=~"api|worker"} |= "JOB-ID"
+```
 
 | Service | URL |
 |---|---|
@@ -49,6 +64,5 @@ The Grafana dashboard shows queue depth, active jobs, request rate, throughput a
 | Grafana | http://localhost:3000 |
 
 ## Roadmap
-- Structured logs with Loki
 - Distributed tracing with OpenTelemetry and Tempo
 - Alerts, load tests and incident report

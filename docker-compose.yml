@@ -46,6 +46,22 @@ services:
       - api
       - worker
 
+  loki:
+    image: grafana/loki:3.2.0
+    ports:
+      - "3100:3100"
+
+  alloy:
+    image: grafana/alloy:v1.4.2
+    command: run --server.http.listen-addr=0.0.0.0:12345 --storage.path=/var/lib/alloy/data /etc/alloy/config.alloy
+    volumes:
+      - ./observability/alloy/config.alloy:/etc/alloy/config.alloy
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "12345:12345"
+    depends_on:
+      - loki
+
   grafana:
     image: grafana/grafana:11.2.0
     env_file: .env
@@ -56,6 +72,7 @@ services:
       - "3000:3000"
     depends_on:
       - prometheus
+      - loki
 
 volumes:
   pgdata:

@@ -18,6 +18,14 @@ celery.conf.update(
 )
 
 
+@signals.setup_logging.connect
+def configure_logging(**kwargs):
+    # Connecting to this signal tells Celery to skip its own log setup.
+    from .logging_config import setup_logging
+
+    setup_logging()
+
+
 @signals.worker_init.connect
 def on_worker_init(**kwargs):
     start_http_server(8001)  # worker metrics at :8001/metrics
