@@ -76,6 +76,7 @@ services:
     env_file: .env
     volumes:
       - ./observability/grafana/provisioning:/etc/grafana/provisioning
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards
       - grafana-data:/var/lib/grafana
     ports:
       - "3000:3000"
