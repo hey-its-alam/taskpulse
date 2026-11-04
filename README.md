@@ -143,9 +143,13 @@ To test them, stop the worker and send jobs:
 ```
 docker compose stop worker
 ```
-The "Worker down" and "Queue backlog" alerts go from Pending to Firing, and return to Normal after `docker compose start worker`.
+The "Worker down" and "Queue backlog" alerts go from Pending to Firing:
 
 ![Alerts firing](docs/screenshots/alerts-firing.png)
+
+After `docker compose start worker` the queue drains and both alerts return to Normal:
+
+![Alerts resolved](docs/screenshots/alerts-resolved.png)
 
 ### Services
 | Service | URL |
