@@ -21,6 +21,10 @@ FastAPI, Celery, Redis, PostgreSQL, Prometheus, Loki, Grafana Alloy, Tempo, Open
 - Failure testing with a written incident report (see [Failure testing](#failure-testing))
 
 ## Architecture
+
+![Architecture](docs/architecture.png)
+
+The same flow as text:
 ```
 Client --> FastAPI (rate limit, save job) --> Redis queue --> Celery worker
                 |                                                  |
@@ -82,24 +86,53 @@ docker compose exec api pytest -q
 
 ## Project structure
 ```
-app/                     FastAPI app, Celery worker, metrics, logging, tracing
-tests/                   Automated tests
-loadtest/
-  baseline.js            Steady load at a chosen rate (RATE, DURATION)
-  rate_limit.js          One abusive client and one normal client
-  spike.js               Sudden traffic spike and recovery
-observability/
-  prometheus/            Scrape configuration
-  tempo/                 Tempo configuration
-  alloy/                 Log collection (Docker logs to Loki)
-  grafana/
-    provisioning/        Data sources and dashboard provider
-    dashboards/          Dashboard JSON, loaded automatically
-docs/
-  incident-report.md     Incident report: jobs stuck after a worker crash
-  worker-kill-evidence.txt  Raw database and Redis output from that test
-  screenshots/           Images used in this README
-docker-compose.yml       All services
+taskpulse/
+├── docker-compose.yml          # runs all 9 containers
+├── Dockerfile                  # one image used by api AND worker
+├── requirements.txt
+├── .env.example                # copy to .env
+├── .env                        # settings (not committed to git)
+├── .gitignore
+├── README.md
+├── app/
+│   ├── __init__.py
+│   ├── main.py                 # FastAPI app, /health, /metrics
+│   ├── config.py               # reads settings from environment
+│   ├── database.py             # SQLAlchemy engine and session
+│   ├── models.py               # Job table
+│   ├── schemas.py              # request/response validation
+│   ├── routes.py               # /jobs endpoints
+│   ├── rate_limiter.py         # Redis rate limiting (429)
+│   ├── celery_app.py           # Celery config + worker startup hook
+│   ├── tasks.py                # the job logic, retries, failures
+│   ├── metrics.py              # Prometheus metrics
+│   ├── logging_config.py       # JSON logs with trace_id
+│   └── telemetry.py            # OpenTelemetry setup
+├── tests/
+│   ├── __init__.py
+│   └── test_api.py
+├── observability/
+│   ├── prometheus/
+│   │   └── prometheus.yml
+│   ├── tempo/
+│   │   └── tempo.yml
+│   ├── alloy/
+│   │   └── config.alloy        # ships container logs to Loki
+│   └── grafana/
+│       ├── provisioning/
+│       │   ├── datasources/datasources.yml
+│       │   └── dashboards/dashboards.yml
+│       └── dashboards/
+│           └── taskpulse.json  # exported from Grafana
+├── loadtest/
+│   ├── baseline.js             # steady load at a chosen rate
+│   ├── rate_limit.js           # one abusive client, one normal client
+│   └── spike.js                # sudden traffic spike and recovery
+└── docs/
+    ├── architecture.png        # architecture diagram
+    ├── incident-report.md      # jobs stuck after a worker crash
+    ├── worker-kill-evidence.txt  # raw output of that test
+    └── screenshots/            # images used in this README
 ```
 
 ## Observability
