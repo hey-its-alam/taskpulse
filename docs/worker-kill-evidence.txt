@@ -1,0 +1,81 @@
+TaskPulse - worker kill test, raw evidence (2026-11-13)
+Command used for status: docker compose exec postgres psql -U taskpulse -d taskpulse -c "SELECT status, count(*) FROM jobs GROUP BY status;"
+Note: database timestamps are UTC. IST = UTC + 5h30m.
+
+----------------------------------------------------------------
+1. BEFORE the kill (spike test already drained)
+----------------------------------------------------------------
+ status  | count
+---------+-------
+ failed  |    12
+ success |  3213
+
+Config check: app\celery_app.py line 13 has task_acks_late=True
+
+----------------------------------------------------------------
+2. DURING: worker killed, queue growing
+----------------------------------------------------------------
+  status  | count
+----------+-------
+ failed   |    12
+ pending  |   151
+ success  |  3300
+ retrying |     3
+ running  |     3
+
+----------------------------------------------------------------
+3. DURING: later, worker restarted, queue draining
+----------------------------------------------------------------
+  status  | count
+----------+-------
+ failed   |    12
+ pending  |   339
+ success  |  3543
+ retrying |    39
+ running  |     7
+
+docker compose exec redis redis-cli HLEN unacked
+(integer) 8
+
+----------------------------------------------------------------
+4. AFTER the queue emptied: 4 jobs stuck
+----------------------------------------------------------------
+Total jobs: 12 + 1 + 3924 + 3 = 3940 (nothing lost from the database)
+
+  status  | count
+----------+-------
+ failed   |    12
+ pending  |     1
+ success  |  3924
+ running  |     3
+
+docker compose exec redis redis-cli LLEN celery   -> (integer) 0
+docker compose exec redis redis-cli HLEN unacked  -> (integer) 4
+
+Stuck jobs:
+                  id                  |      type       | status  |          started_at
+--------------------------------------+-----------------+---------+-------------------------------
+ dac1ec8d-0a45-45a8-9d5c-93008359822f | resize_image    | pending |
+ 2b841731-6727-4e44-bd82-20976e30231d | generate_report | running | 2026-11-13 05:09:07.187402+00
+ daa42824-dece-40b8-ba4c-ae2f22c2ba13 | send_email      | running | 2026-11-13 05:09:07.687955+00
+ ab66da18-47d2-47f0-a6ba-6a4d6b8245c4 | generate_report | running | 2026-11-13 05:09:04.196826+00
+
+Job rows: retries = 0, error_message empty, finished_at empty.
+
+----------------------------------------------------------------
+5. AFTER the fix (visibility_timeout=120, rebuilt, restarted)
+----------------------------------------------------------------
+ status  | count
+---------+-------
+ failed  |    12
+ success |  3928
+
+docker compose exec redis redis-cli HLEN unacked -> (integer) 0
+
+----------------------------------------------------------------
+6. k6 run (RATE=2, 6 minutes)
+----------------------------------------------------------------
+721 requests, 715 accepted (202), 2 x 503, 4 connection EOF errors
+http_req_duration: p(95)=20.87ms, p(99)=27.73ms
+threshold jobs_unexpected_status crossed (count=4, all EOF)
+Worker log: last retry lines at 10:38:58 IST, consistent with the kill at ~10:39

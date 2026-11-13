@@ -1,9 +1,9 @@
 # TaskPulse
 
-Distributed job processing platform with full observability: metrics, logs and traces, linked together in Grafana, with alerting.
+Distributed job processing platform with full observability: metrics, logs and traces, linked together in Grafana, with alerting. Load tested with k6 and failure tested with a worker crash.
 
 ## Stack
-FastAPI, Celery, Redis, PostgreSQL, Prometheus, Loki, Grafana Alloy, Tempo, OpenTelemetry, Grafana, Docker Compose
+FastAPI, Celery, Redis, PostgreSQL, Prometheus, Loki, Grafana Alloy, Tempo, OpenTelemetry, Grafana, k6, Docker Compose
 
 ## Features
 - Submit background jobs over HTTP (202 Accepted)
@@ -17,6 +17,8 @@ FastAPI, Celery, Redis, PostgreSQL, Prometheus, Loki, Grafana Alloy, Tempo, Open
 - Distributed tracing with OpenTelemetry and Tempo (API, queue, worker and database in one trace)
 - Logs and traces linked by trace ID in Grafana, in both directions
 - Grafana alert rules for queue backlog, worker down and a high job failure ratio
+- k6 load tests: steady load, rate limiting and a traffic spike
+- Failure testing with a written incident report (see [Failure testing](#failure-testing))
 
 ## Architecture
 ```
@@ -62,6 +64,8 @@ Set in `.env` (see `.env.example`).
 | `FAILURE_RATE` | Share of simulated job failures (for failure testing) |
 | `EXTRA_LATENCY_SECONDS` | Extra delay added to every job (for slowness testing) |
 
+The Celery broker visibility timeout is set in `app/celery_app.py` (`broker_transport_options`, 120 seconds). See [Failure testing](#failure-testing) for why.
+
 ## Run
 ```
 copy .env.example .env
@@ -80,6 +84,10 @@ docker compose exec api pytest -q
 ```
 app/                     FastAPI app, Celery worker, metrics, logging, tracing
 tests/                   Automated tests
+loadtest/
+  baseline.js            Steady load at a chosen rate (RATE, DURATION)
+  rate_limit.js          One abusive client and one normal client
+  spike.js               Sudden traffic spike and recovery
 observability/
   prometheus/            Scrape configuration
   tempo/                 Tempo configuration
@@ -87,7 +95,10 @@ observability/
   grafana/
     provisioning/        Data sources and dashboard provider
     dashboards/          Dashboard JSON, loaded automatically
-docs/screenshots/        Images used in this README
+docs/
+  incident-report.md     Incident report: jobs stuck after a worker crash
+  worker-kill-evidence.txt  Raw database and Redis output from that test
+  screenshots/           Images used in this README
 docker-compose.yml       All services
 ```
 
@@ -160,6 +171,72 @@ After `docker compose start worker` the queue drains and both alerts return to N
 | Loki | http://localhost:3100 |
 | Tempo | http://localhost:3200 |
 
+## Load tests
+The load tests use [k6](https://grafana.com/docs/k6/latest/set-up/install-k6/) and run from the host against `http://localhost:8000`. Change the target with `-e BASE_URL=...`.
+In all three scripts the HTTP statuses 202, 429 and 503 count as expected answers. Any other status is counted in `jobs_unexpected_status`, and the test fails if that counter is above zero.
+
+| Script | What it does | How to run | Passes when |
+|---|---|---|---|
+| `baseline.js` | Constant request rate. Every request uses a new `X-API-Key`, so the rate limiter does not interfere. | `k6 run -e RATE=5 loadtest/baseline.js` (`RATE` default 1 per second, `DURATION` default 2m) | p95 under 500 ms, p99 under 1000 ms, at least 99% of requests accepted (202), no unexpected status |
+| `rate_limit.js` | One client sends far above the limit while a second client with its own key stays below it. | `k6 run loadtest/rate_limit.js` (`RATE` default 20 per second, `DURATION` default 30s) | The limiter returns 429 to the abusive client, and at least 99% of the normal client's requests are accepted |
+| `spike.js` | 1 request/s, then a sudden jump to `PEAK` (default 100/s) in 10 s, held for 1 minute, then back to 1/s for `RECOVERY` (default 5m). About 6m50s in total. | `k6 run loadtest/spike.js` (use `-e PEAK=50` on a slow machine) | p95 under 2 s, no unexpected status, fewer than 50 dropped iterations |
+
+### What the tests showed
+- **Worker capacity.** Grafana showed the worker finishing about **85 jobs per minute** (about 1.4 jobs per second, 4 jobs at a time). Any sustained submit rate above that makes the queue grow.
+- **Spike test (PEAK=100).** k6 completed 7,320 requests with none interrupted. Queue depth rose to about 495, just under the limit of 500, and the workers stayed UP. No rate limit (429) appeared, because every request used its own key. Afterwards the queue drained on its own and the database showed no pending or running jobs.
+
+### Screenshots
+
+**Baseline, 1 request per second**
+
+![Grafana, baseline at 1 request per second](docs/screenshots/grafana-baseline-rate1-mid.png)
+
+![k6 summary, baseline at 1 request per second](docs/screenshots/k6-baseline-rate1.png)
+
+**Baseline, 5 requests per second**
+
+![Grafana, baseline at 5 requests per second](docs/screenshots/grafana-baseline-rate5-mid.png)
+
+**Baseline, 10 requests per second**
+
+![Grafana, baseline at 10 requests per second](docs/screenshots/grafana-baseline-rate10-mid.png)
+
+![Grafana, baseline at 10 requests per second, after the run](docs/screenshots/grafana-baseline-rate10-complete.png)
+
+**Dashboard during baseline testing**
+
+![Grafana during a baseline test](docs/screenshots/grafana-baseline-mid.png)
+
+![Dashboard during baseline testing](docs/screenshots/dashboard-baseline.png)
+
+![Dashboard details during baseline testing](docs/screenshots/dashboard-baseline-details.png)
+
+**Rate limit test**
+
+![Grafana during the rate limit test](docs/screenshots/grafana-rate-limit-mid.png)
+
+**Spike test**
+
+![Grafana during the spike](docs/screenshots/grafana-spike-peak.png)
+
+## Failure testing
+The worker container was killed during a 6 minute k6 run (2 requests per second) and started again after a few minutes.
+
+- **While the worker was down:** the API kept answering, with **p95 20.87 ms and p99 27.73 ms** over 721 requests (715 accepted, 2 rejected with 503 when the queue reached its limit, 4 connection errors). The queue grew to about 500, and the Workers up panel showed DOWN.
+- **After the worker came back:** throughput returned to about 85 jobs per minute and the queue drained.
+- **Problem found:** 4 jobs stayed stuck (3 `running`, 1 `pending`) after the queue was empty, and the dashboard showed 0 active jobs. They were not lost from the database, but nothing was going to run them for up to an hour. With Redis as the broker and `acks_late` enabled, messages held by a dead worker only return to the queue after the visibility timeout, which defaults to 1 hour.
+- **Fix:** `broker_transport_options={"visibility_timeout": 120}` in `app/celery_app.py`. After rebuilding, the 4 stuck jobs finished and `unacked` went back to 0. This was confirmed on those 4 jobs; a second worker kill after the fix has not been run yet.
+
+![Worker killed](docs/screenshots/grafana-worker-kill.png)
+
+![Worker back, queue draining](docs/screenshots/grafana-worker-recovered.png)
+
+Full write-up with timeline, root cause and action items: [docs/incident-report.md](docs/incident-report.md). Raw output of the test: [docs/worker-kill-evidence.txt](docs/worker-kill-evidence.txt).
+
 ## Roadmap
-- Load tests with k6 and failure simulations
-- Incident report
+- "Stuck jobs" dashboard panel and alert (jobs in `running` or `pending` for more than 5 minutes)
+- Re-run the worker kill test after the visibility timeout fix, with a load below worker capacity
+- Make tasks safe to run twice (a recovered job can run again with `acks_late`)
+- Redis and PostgreSQL outage simulations
+- Find the cause of the connection EOF errors seen by k6
+- Pin dependency versions in `requirements.txt`
