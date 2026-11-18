@@ -143,9 +143,16 @@ taskpulse/
 └── docs/
     ├── architecture.png        # architecture diagram
     ├── incident-report.md      # jobs stuck after a worker crash
+    ├── runbook.md              # operations runbook: checks, troubleshooting, recovery
     ├── worker-kill-evidence.txt  # raw output of that test
     └── screenshots/            # images used in this README
 ```
+
+## Documentation
+
+- [Operations Runbook](docs/runbook.md) — Setup checks, troubleshooting, alerts, logs, traces and incident recovery.
+- [Incident Report](docs/incident-report.md) — Worker crash investigation, root cause and recovery.
+- [Worker Kill Evidence](docs/worker-kill-evidence.txt) — Raw output from the worker crash test.
 
 ## Observability
 
@@ -320,7 +327,6 @@ Full write-up with timeline, root cause and action items: [docs/incident-report.
 ## Roadmap
 - "Stuck jobs" dashboard panel and alert (jobs in `running` or `pending` for more than 5 minutes)
 - Alerts on failure reasons and on dependency health
-- `docs/runbook.md`: what to check and what to do for each failure reason
 - Re-run the worker kill test after the visibility timeout fix, with a load below worker capacity
 - Make tasks safe to run twice (a recovered job can run again with `acks_late`)
 - Redis and PostgreSQL outage simulations
