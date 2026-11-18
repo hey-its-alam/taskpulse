@@ -3,7 +3,7 @@
 Distributed job processing platform with full observability: metrics, logs and traces, linked together in Grafana, with alerting. Load tested with k6 and failure tested with a worker crash.
 
 ## Stack
-FastAPI, Celery, Redis, PostgreSQL, Prometheus, Loki, Grafana Alloy, Tempo, OpenTelemetry, Grafana, k6, Docker Compose
+FastAPI, Celery, Redis, PostgreSQL, Prometheus, Loki, Grafana Alloy, Tempo, OpenTelemetry, Grafana, k6, Docker Compose, psutil
 
 ## Features
 - Submit background jobs over HTTP (202 Accepted)
@@ -17,7 +17,11 @@ FastAPI, Celery, Redis, PostgreSQL, Prometheus, Loki, Grafana Alloy, Tempo, Open
 - Distributed tracing with OpenTelemetry and Tempo (API, queue, worker and database in one trace)
 - Logs and traces linked by trace ID in Grafana, in both directions
 - Grafana alert rules for queue backlog, worker down and a high job failure ratio
+- Failure reason classification for simulated, timeout, Redis, database, network, memory, disk, code and unknown failures
+- System health metrics for CPU, memory, disk, Redis and PostgreSQL
+- Separate Grafana Failure Diagnostics dashboard
 - k6 load tests: steady load, rate limiting and a traffic spike
+- Failure-mix testing with valid submissions, invalid job types and optional rate-limit traffic
 - Failure testing with a written incident report (see [Failure testing](#failure-testing))
 
 ## Architecture
@@ -83,6 +87,7 @@ Open http://localhost:8000/docs and submit a job.
 ```
 docker compose exec api pytest -q
 ```
+Latest verification: 37 passed, 1 warning. The warning is a Starlette/httpx deprecation warning; the tests passed.
 
 ## Project structure
 ```
@@ -105,12 +110,17 @@ taskpulse/
 │   ├── rate_limiter.py         # Redis rate limiting (429)
 │   ├── celery_app.py           # Celery config + worker startup hook
 │   ├── tasks.py                # the job logic, retries, failures
+│   ├── failure_reasons.py      # turns an exception into a failure reason
+│   ├── system_metrics.py       # CPU, memory, disk, Redis and PostgreSQL health
 │   ├── metrics.py              # Prometheus metrics
 │   ├── logging_config.py       # JSON logs with trace_id
 │   └── telemetry.py            # OpenTelemetry setup
 ├── tests/
 │   ├── __init__.py
-│   └── test_api.py
+│   ├── test_api.py
+│   ├── test_failure_reasons.py
+│   ├── test_system_metrics.py
+│   └── test_task_failures.py
 ├── observability/
 │   ├── prometheus/
 │   │   └── prometheus.yml
@@ -123,11 +133,13 @@ taskpulse/
 │       │   ├── datasources/datasources.yml
 │       │   └── dashboards/dashboards.yml
 │       └── dashboards/
-│           └── taskpulse.json  # exported from Grafana
+│           ├── taskpulse.json           # exported from Grafana
+│           └── taskpulse-failures.json  # failure diagnostics dashboard
 ├── loadtest/
 │   ├── baseline.js             # steady load at a chosen rate
 │   ├── rate_limit.js           # one abusive client, one normal client
-│   └── spike.js                # sudden traffic spike and recovery
+│   ├── spike.js                # sudden traffic spike and recovery
+│   └── failure_mix.js          # valid, invalid and optional rate-limit traffic
 └── docs/
     ├── architecture.png        # architecture diagram
     ├── incident-report.md      # jobs stuck after a worker crash
@@ -140,7 +152,7 @@ taskpulse/
 ### Metrics
 Prometheus scrapes metrics from the API (`:8000/metrics`) and the worker (`:8001/metrics`).
 The Grafana dashboard is loaded automatically from `observability/grafana/dashboards/taskpulse.json`.
-It shows worker status, queue depth, throughput, job duration (p50 and p95), jobs by status, API request rate, error ratio and latency, retries, rate limited requests, and recent worker warnings.
+It shows worker status, queue depth, throughput, job duration (p50 and p95), jobs by status, API request rate, error ratio and latency, retries, rate-limited requests, and recent worker warnings.
 
 ![Final dashboard](docs/screenshots/dashboard-final.png)
 
@@ -154,6 +166,7 @@ Useful queries:
 ```
 {service="worker"} | json | level="WARNING"
 {service=~"api|worker"} |= "JOB-ID"
+{service="worker"} |= "reason=database_error"
 ```
 
 ### Traces
@@ -195,6 +208,40 @@ After `docker compose start worker` the queue drains and both alerts return to N
 
 ![Alerts resolved](docs/screenshots/alerts-resolved.png)
 
+### Failure diagnostics (Observability V2)
+A separate dashboard shows why jobs fail, not only how many. It is provisioned from `observability/grafana/dashboards/taskpulse-failures.json` and kept apart from the main dashboard.
+
+**Failure reasons.** Every failed attempt in the worker is classified into one fixed reason, counted in `taskpulse_job_failures_total{type,reason}` and written to the log line as `reason=...`.
+
+| Reason | Meaning |
+|---|---|
+| `simulated` | Failure produced on purpose by `FAILURE_RATE` |
+| `timeout` | A task or a dependency took too long |
+| `redis_error` | Redis (the queue) was unreachable or returned an error |
+| `database_error` | PostgreSQL was unreachable or returned an error |
+| `network_error` | Connection refused, reset or DNS failure |
+| `out_of_memory` | `MemoryError` |
+| `disk_full` | No space left on the device |
+| `code_error` | A bug in the code (wrong type, missing key, division by zero and similar) |
+| `unknown` | Anything else |
+
+Errors outside the simulated work, for example the database being unreachable while a job starts, are counted with a reason too and retried up to 3 times (2, 4 and 8 seconds).
+
+If a job is saved but cannot be put on the queue (for example Redis is down), the job is marked `failed`, the API answers 503 "Queue unavailable", and `taskpulse_enqueue_failures_total` goes up.
+
+**System health.** The API and the worker both export:
+
+| Metric | Meaning |
+|---|---|
+| `taskpulse_dependency_up{dependency="redis"}` and `{dependency="postgres"}` | 1 if the dependency answered a quick check, otherwise 0 |
+| `taskpulse_cpu_used_ratio` | CPU busy, 0 to 1 |
+| `taskpulse_memory_used_ratio` | Memory used, 0 to 1 |
+| `taskpulse_disk_used_ratio` | Disk used, 0 to 1 |
+
+Inside Docker Desktop, CPU and memory describe the Linux VM that runs all the containers. Memory and CPU of each process are also available as `process_resident_memory_bytes` and `process_cpu_seconds_total`.
+
+**Dashboard panels.** Failure attempts by reason, total failure attempts, enqueue failures, Redis and PostgreSQL health, CPU, memory and disk usage, job retry rate, and worker warning and error logs.
+
 ### Services
 | Service | URL |
 |---|---|
@@ -206,13 +253,17 @@ After `docker compose start worker` the queue drains and both alerts return to N
 
 ## Load tests
 The load tests use [k6](https://grafana.com/docs/k6/latest/set-up/install-k6/) and run from the host against `http://localhost:8000`. Change the target with `-e BASE_URL=...`.
-In all three scripts the HTTP statuses 202, 429 and 503 count as expected answers. Any other status is counted in `jobs_unexpected_status`, and the test fails if that counter is above zero.
 
-| Script | What it does | How to run | Passes when |
+The baseline, rate limit and spike scripts treat the HTTP statuses 202, 429 and 503 as expected answers. Any other status is counted in `jobs_unexpected_status`, and the test fails if that counter is above zero. `failure_mix.js` also expects 422 and has no pass or fail conditions.
+
+| Script | What it does | How to run | Pass condition |
 |---|---|---|---|
 | `baseline.js` | Constant request rate. Every request uses a new `X-API-Key`, so the rate limiter does not interfere. | `k6 run -e RATE=5 loadtest/baseline.js` (`RATE` default 1 per second, `DURATION` default 2m) | p95 under 500 ms, p99 under 1000 ms, at least 99% of requests accepted (202), no unexpected status |
 | `rate_limit.js` | One client sends far above the limit while a second client with its own key stays below it. | `k6 run loadtest/rate_limit.js` (`RATE` default 20 per second, `DURATION` default 30s) | The limiter returns 429 to the abusive client, and at least 99% of the normal client's requests are accepted |
 | `spike.js` | 1 request/s, then a sudden jump to `PEAK` (default 100/s) in 10 s, held for 1 minute, then back to 1/s for `RECOVERY` (default 5m). About 6m50s in total. | `k6 run loadtest/spike.js` (use `-e PEAK=50` on a slow machine) | p95 under 2 s, no unexpected status, fewer than 50 dropped iterations |
+| `failure_mix.js` | Valid job submissions, invalid job types (expected to be rejected with 422) and optional rate-limit traffic. | `k6 run -e JOB_RATE=1 -e BAD_RATE=1 -e HAMMER_RATE=0 -e DURATION=1m loadtest/failure_mix.js` | None. It reports a count per response type: `resp_202_accepted`, `resp_422_invalid`, `resp_429_rate_limited`, `resp_503_queue_full`, `resp_5xx_server_error`, `resp_0_network_error`, `resp_other` |
+
+To make about half of the jobs end as `failed`, set `FAILURE_RATE=0.84` in `.env` and run `docker compose up -d --force-recreate worker`. A job gets 4 attempts (1 plus 3 retries), so with a failure chance of 0.84 per attempt about half of the jobs fail all 4 attempts.
 
 ### What the tests showed
 - **Worker capacity.** Grafana showed the worker finishing about **85 jobs per minute** (about 1.4 jobs per second, 4 jobs at a time). Any sustained submit rate above that makes the queue grow.
@@ -268,6 +319,8 @@ Full write-up with timeline, root cause and action items: [docs/incident-report.
 
 ## Roadmap
 - "Stuck jobs" dashboard panel and alert (jobs in `running` or `pending` for more than 5 minutes)
+- Alerts on failure reasons and on dependency health
+- `docs/runbook.md`: what to check and what to do for each failure reason
 - Re-run the worker kill test after the visibility timeout fix, with a load below worker capacity
 - Make tasks safe to run twice (a recovered job can run again with `acks_late`)
 - Redis and PostgreSQL outage simulations
