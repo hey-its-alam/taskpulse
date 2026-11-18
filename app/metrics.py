@@ -14,10 +14,12 @@ _redis = redis.Redis.from_url(settings.redis_url)
 JOBS_SUBMITTED = Counter("taskpulse_jobs_submitted", "Jobs accepted by the API", ["type"])
 RATE_LIMITED = Counter("taskpulse_rate_limited", "Requests rejected with HTTP 429", ["scope"])
 BACKPRESSURE = Counter("taskpulse_backpressure_rejections", "Jobs rejected: queue is full")
+ENQUEUE_FAILURES = Counter("taskpulse_enqueue_failures", "Jobs saved but could not be put on the queue")
 
 # ---- Worker side ----
 JOBS_PROCESSED = Counter("taskpulse_jobs_processed", "Jobs finished by workers", ["type", "status"])
 JOB_RETRIES = Counter("taskpulse_job_retries", "Job retry attempts", ["type"])
+JOB_FAILURES = Counter("taskpulse_job_failures", "Failed job attempts, by reason", ["type", "reason"])
 JOB_DURATION = Histogram(
     "taskpulse_job_duration_seconds", "Job execution time", ["type"],
     buckets=(0.25, 0.5, 1, 2, 4, 8, 16, 32),
@@ -57,3 +59,10 @@ class JobStatusCollector:
 
 def register_db_collector():
     REGISTRY.register(JobStatusCollector())
+
+
+# Dependency health, disk, memory and CPU. This file is imported by both the API and the worker,
+# so both processes export these metrics.
+from .system_metrics import register_system_collector  # noqa: E402
+
+register_system_collector()
