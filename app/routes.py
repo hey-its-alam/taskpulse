@@ -1,3 +1,4 @@
+
 import logging
 from typing import Optional
 from uuid import UUID
@@ -9,7 +10,12 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .database import get_db
-from .metrics import BACKPRESSURE, JOBS_SUBMITTED, queue_depth
+from .metrics import (
+    BACKPRESSURE,
+    ENQUEUE_FAILURES,
+    JOBS_SUBMITTED,
+    queue_depth,
+)
 from .models import Job
 from .rate_limiter import rate_limit
 from .schemas import JobCreate, JobOut
@@ -25,28 +31,62 @@ def current_trace_id() -> Optional[str]:
 
 
 @router.post(
-    "", response_model=JobOut, status_code=202,
+    "",
+    response_model=JobOut,
+    status_code=202,
     dependencies=[Depends(rate_limit("submit", settings.rate_limit_submit))],
 )
 def submit_job(body: JobCreate, db: Session = Depends(get_db)):
-    # Backpressure: refuse new work when the queue is already too long.
+    # Backpressure: reject new jobs when the queue is full.
     if queue_depth() >= settings.max_queue_depth:
         BACKPRESSURE.inc()
-        raise HTTPException(503, "Queue is full, try again later", headers={"Retry-After": "10"})
+        raise HTTPException(
+            503,
+            "Queue is full, try again later",
+            headers={"Retry-After": "10"},
+        )
 
-    job = Job(type=body.type, payload=body.payload, status="pending", trace_id=current_trace_id())
+    job = Job(
+        type=body.type,
+        payload=body.payload,
+        status="pending",
+        trace_id=current_trace_id(),
+    )
     db.add(job)
     db.commit()
     db.refresh(job)
 
-    run_job.delay(str(job.id))
+    try:
+        run_job.delay(str(job.id))
+    except Exception as exc:
+        ENQUEUE_FAILURES.inc()
+
+        job.status = "failed"
+        job.error_message = f"queue unavailable: {exc.__class__.__name__}"
+        db.commit()
+
+        log.error(
+            "could not enqueue job id=%s type=%s reason=queue_unavailable error=%s",
+            job.id,
+            job.type,
+            exc.__class__.__name__,
+        )
+
+        raise HTTPException(
+            503,
+            "Queue unavailable, try again later",
+            headers={"Retry-After": "10"},
+        ) from exc
+
     JOBS_SUBMITTED.labels(type=job.type).inc()
+
     log.info("job submitted id=%s type=%s", job.id, job.type)
     return job
 
 
 @router.get(
-    "", response_model=list[JobOut],
+    "",
+    response_model=list[JobOut],
     dependencies=[Depends(rate_limit("read", settings.rate_limit_read))],
 )
 def list_jobs(
@@ -55,39 +95,76 @@ def list_jobs(
     offset: int = 0,
     db: Session = Depends(get_db),
 ):
-    stmt = select(Job).order_by(Job.created_at.desc()).limit(limit).offset(offset)
+    stmt = (
+        select(Job)
+        .order_by(Job.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+
     if status:
         stmt = stmt.where(Job.status == status)
+
     return db.execute(stmt).scalars().all()
 
 
 @router.get(
-    "/{job_id}", response_model=JobOut,
+    "/{job_id}",
+    response_model=JobOut,
     dependencies=[Depends(rate_limit("read", settings.rate_limit_read))],
 )
 def get_job(job_id: UUID, db: Session = Depends(get_db)):
     job = db.get(Job, job_id)
+
     if job is None:
         raise HTTPException(404, "Job not found")
+
     return job
 
 
 @router.post(
-    "/{job_id}/retry", response_model=JobOut, status_code=202,
+    "/{job_id}/retry",
+    response_model=JobOut,
+    status_code=202,
     dependencies=[Depends(rate_limit("retry", settings.rate_limit_retry))],
 )
 def retry_job(job_id: UUID, db: Session = Depends(get_db)):
     job = db.get(Job, job_id)
+
     if job is None:
         raise HTTPException(404, "Job not found")
+
     if job.status != "failed":
         raise HTTPException(409, "Only failed jobs can be retried")
+
     job.status = "pending"
     job.retries = 0
     job.error_message = None
     job.started_at = None
     job.finished_at = None
     db.commit()
-    run_job.delay(str(job.id))
-    log.info("job manually retried id=%s", job.id)
+
+    try:
+        run_job.delay(str(job.id))
+    except Exception as exc:
+        ENQUEUE_FAILURES.inc()
+
+        job.status = "failed"
+        job.error_message = f"queue unavailable: {exc.__class__.__name__}"
+        db.commit()
+
+        log.error(
+            "could not enqueue retry id=%s type=%s reason=queue_unavailable error=%s",
+            job.id,
+            job.type,
+            exc.__class__.__name__,
+        )
+
+        raise HTTPException(
+            503,
+            "Queue unavailable, try again later",
+            headers={"Retry-After": "10"},
+        ) from exc
+
+    log.info("job manually retried id=%s type=%s", job.id, job.type)
     return job

@@ -15,3 +15,4 @@ opentelemetry-instrumentation-sqlalchemy
 opentelemetry-instrumentation-celery
 pytest
 httpx
+psutil
