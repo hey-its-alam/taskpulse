@@ -144,7 +144,7 @@ The queue maximum is a protective backpressure limit; HTTP 503 at capacity is ex
 
 1. Open the **TaskPulse Failure Diagnostics** dashboard.
 2. Review failure counts grouped by job type and reason.
-3. Inspect the worker warning and error logs.
+3. Inspect the worker warning and error logs (see section 8).
 4. Copy the log's `trace_id` and search for that trace in Grafana Explore using Tempo.
 5. Check the job record in PostgreSQL for its status, retry count, error message, and timestamps:
 
@@ -160,9 +160,11 @@ docker compose exec postgres psql -U taskpulse -d taskpulse -P pager=off -c "SEL
 
 To find the logs of one reason in Grafana Explore (Loki):
 
+```logql
+{service="worker"} | json | reason="database_error"
 ```
-{service="worker"} |= "reason=database_error"
-```
+
+Field meanings and more queries are in section 8.
 
 The project classifies failures into these fixed reasons:
 
@@ -242,18 +244,205 @@ This is what the code is written to do. Redis and PostgreSQL outage tests have n
 - **Redis down:** `POST /jobs` saves the job, cannot queue it, marks it `failed` (`queue unavailable: ...`), answers HTTP 503 "Queue unavailable", and increases `taskpulse_enqueue_failures_total`. Rate limiting fails open. The worker cannot receive jobs.
 - **PostgreSQL down:** requests that need the database return errors. A worker that cannot reach the database counts the failure with reason `database_error` and retries up to 3 times (2, 4 and 8 seconds). If the database stays down, the job row can stay in its last saved status.
 
-## 8. Logs and distributed traces
+## 8. Structured logging and failure diagnostics
+
+This section describes how to investigate API requests, worker jobs, failures and memory usage using the structured JSON logs in Grafana and Loki.
+
+### 8.1 Log collection flow
+
+```text
+FastAPI / Celery worker
+        |
+        v
+Structured JSON logs (one JSON object per line)
+        |
+        v
+Docker stdout
+        |
+        v
+Grafana Alloy (parses the JSON lines)
+        |
+        v
+Loki
+        |
+        v
+Grafana Explore and dashboards
+```
+
+The Alloy configuration is maintained in `observability/alloy/config.alloy`.
+
+### 8.2 API request logs
+
+API request logs include:
+
+- `request_id`: unique request identifier.
+- `method`: HTTP method.
+- `path`: request route.
+- `status_code`: HTTP response status.
+- `duration_ms`: request processing time.
+- `client`: hashed client identifier.
+- `process_rss_mb`: memory held by the API process.
+- `memory_delta_mb`: memory change during the request.
+- `system_memory_percent`: system memory utilization.
+- `trace_id`: distributed trace identifier.
+
+Client identifiers are hashed before logging. Raw API keys and IP addresses should not be written to structured logs.
+
+To inspect API request logs, open Grafana → Explore → Loki:
+
+```logql
+{service="api"} | json | event="request_completed"
+```
+
+### 8.3 Worker job logs
+
+Worker events provide visibility into job execution:
+
+- `job_started`
+- `job_retry_scheduled`
+- `job_succeeded`
+- `job_failed`
+- `job_crashed`
+- `job_resource_usage`
+
+Important fields include:
+
+- `job_id` and `job_type`
+- `attempt` and `max_attempts`
+- `duration_ms`
+- `memory_rss_mb`
+- `memory_before_mb`
+- `memory_delta_mb`
+- `system_memory_percent`
+- `reason`, `error_type` and `error_message`
+- `trace_id`
+
+Useful Loki queries:
+
+**Worker errors**
+
+```logql
+{service="worker"} | json | level="ERROR"
+```
+
+**Retries and permanent failures**
+
+```logql
+{service="worker"} | json | event=~"job_failed|job_retry_scheduled|job_crashed"
+```
+
+**Resource usage**
+
+```logql
+{service="worker"} | json | event="job_resource_usage"
+```
+
+**Logs for a particular job** (replace `JOB-ID` with the actual job ID)
+
+```logql
+{service="worker"} | json | job_id="JOB-ID"
+```
+
+**Logs of one failure reason**
+
+```logql
+{service="worker"} | json | reason="database_error"
+```
+
+### 8.4 Understanding memory fields
+
+| Field | Meaning |
+|---|---|
+| `memory_rss_mb` | Worker process resident memory (RAM) at the measurement point |
+| `memory_before_mb` | Memory recorded before job execution |
+| `memory_delta_mb` | Change in process RSS during the job |
+| `process_rss_mb` | API process resident memory |
+| `system_memory_percent` | Overall system memory utilization |
+
+A positive memory delta means process RSS increased during the measured interval. A negative delta means it decreased.
+
+RSS is process memory, not memory exclusively allocated to an individual job or request. Read it as a process-level measurement around the work. Three limits to keep in mind:
+
+- Python often keeps freed memory, so a small or zero delta does not prove that a job used no memory.
+- The API handles several requests at the same time in one process, so the memory in an API log line cannot be assigned to a single client or request.
+- Inside Docker Desktop, `system_memory_percent` describes the Linux VM that runs all the containers.
+
+### 8.5 Grafana Failure Diagnostics dashboard
+
+Open the **TaskPulse Failure Diagnostics** dashboard.
+
+Use these panels during an investigation:
+
+- **Failure Attempts by Reason:** identifies the recorded failure reasons.
+- **Last Errors:** displays recent worker error logs.
+- **Memory Usage per Job Type:** helps compare resource usage across job types.
+- **Clients:** helps investigate client-related activity.
+- **Worker Warning and Error Logs:** provides detailed worker events.
 
 For a failure investigation:
 
-1. Open Grafana and select the **TaskPulse Failure Diagnostics** dashboard.
-2. Find a relevant worker warning or error log.
-3. Copy its `trace_id`.
-4. Open Grafana → Explore and select Tempo.
-5. Search by the exact trace ID.
-6. Inspect available spans and their durations and errors.
+1. Check the failure reason.
+2. Open the Last Errors panel.
+3. Inspect `job_id`, `attempt`, `error_type` and `error_message`.
+4. Copy the `trace_id`.
+5. Open Grafana → Explore → Tempo and search using that trace ID.
+6. Compare the job's resource-usage event with its failure event.
 
-Use the same trace ID to correlate the log and trace. Some failures may not have a complete trace or all expected spans; record that as an observability gap rather than assuming the operation succeeded.
+Use the same trace ID to correlate the log and the trace. Some failures may not have a complete trace or all expected spans; record that as an observability gap rather than assuming the operation succeeded.
+
+### 8.6 Troubleshooting missing logs
+
+If expected logs do not appear in Grafana:
+
+1. Check whether the API and worker containers are running:
+
+   ```powershell
+   docker compose ps api worker
+   ```
+
+2. Inspect recent container output:
+
+   ```powershell
+   docker compose logs --tail 100 api
+   docker compose logs --tail 100 worker
+   ```
+
+3. Check Alloy:
+
+   ```powershell
+   docker compose logs --tail 100 alloy
+   ```
+
+4. Check the syntax of Alloy's configuration. This prints the formatted file; an error message means a syntax problem. It does not prove that the pipeline works, so also run the broad query in step 6.
+
+   ```powershell
+   docker compose exec alloy alloy fmt /etc/alloy/config.alloy
+   ```
+
+   The path is where the file is mounted inside the Alloy container; check the Alloy volume in `docker-compose.yml` if it differs.
+
+5. Confirm Loki is running:
+
+   ```powershell
+   docker compose ps loki
+   docker compose logs --tail 100 loki
+   ```
+
+6. Open Grafana Explore, select Loki, and check a broad query:
+
+   ```logql
+   {service="worker"}
+   ```
+
+If logs exist in Docker output but not in Loki, investigate Alloy discovery, parsing and forwarding before changing application logging code.
+
+### 8.7 Log and metadata guidelines
+
+- Keep indexed Loki labels low-cardinality, such as `level`, `event` and `reason`. Every new label value creates a new Loki stream.
+- Keep identifiers such as `job_id`, `request_id`, `trace_id` and `client` out of the labels. They stay in the log line (or in structured metadata, if it is enabled in Alloy) and are read with `| json`.
+- Do not log raw API keys, credentials or sensitive client information.
+- Use `trace_id` to correlate logs with distributed traces.
+- Do not assume a missing log means a job succeeded; verify its persisted status and worker events as well.
 
 ## 9. System resource metrics
 

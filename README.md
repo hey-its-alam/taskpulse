@@ -13,7 +13,8 @@ FastAPI, Celery, Redis, PostgreSQL, Prometheus, Loki, Grafana Alloy, Tempo, Open
 - Per-client rate limiting (HTTP 429 with Retry-After)
 - Queue backpressure (HTTP 503 when the queue is full)
 - Prometheus metrics and a provisioned Grafana dashboard (queue depth, throughput, job duration, errors)
-- Structured JSON logs shipped to Loki and searchable in Grafana
+- Structured JSON logs with a fixed schema, request and job IDs, error details and memory fields, parsed by Grafana Alloy and searchable in Grafana
+- One log line per API request with a hashed client identity, duration, status code and memory (see [Structured logging](#structured-logging))
 - Distributed tracing with OpenTelemetry and Tempo (API, queue, worker and database in one trace)
 - Logs and traces linked by trace ID in Grafana, in both directions
 - Grafana alert rules for queue backlog, worker down and a high job failure ratio
@@ -87,7 +88,6 @@ Open http://localhost:8000/docs and submit a job.
 ```
 docker compose exec api pytest -q
 ```
-Latest verification: 37 passed, 1 warning. The warning is a Starlette/httpx deprecation warning; the tests passed.
 
 ## Project structure
 ```
@@ -113,12 +113,16 @@ taskpulse/
 │   ├── failure_reasons.py      # turns an exception into a failure reason
 │   ├── system_metrics.py       # CPU, memory, disk, Redis and PostgreSQL health
 │   ├── metrics.py              # Prometheus metrics
-│   ├── logging_config.py       # JSON logs with trace_id
+│   ├── logging_config.py       # structured JSON logs: fixed schema, context fields, redaction
+│   ├── request_logging.py      # one structured log line per API request
+│   ├── resource_usage.py       # process and system memory readings for log lines
 │   └── telemetry.py            # OpenTelemetry setup
 ├── tests/
 │   ├── __init__.py
 │   ├── test_api.py
 │   ├── test_failure_reasons.py
+│   ├── test_logging_config.py
+│   ├── test_request_logging.py
 │   ├── test_system_metrics.py
 │   └── test_task_failures.py
 ├── observability/
@@ -127,7 +131,7 @@ taskpulse/
 │   ├── tempo/
 │   │   └── tempo.yml
 │   ├── alloy/
-│   │   └── config.alloy        # ships container logs to Loki
+│   │   └── config.alloy        # parses JSON logs and ships them to Loki
 │   └── grafana/
 │       ├── provisioning/
 │       │   ├── datasources/datasources.yml
@@ -175,6 +179,74 @@ Useful queries:
 {service=~"api|worker"} |= "JOB-ID"
 {service="worker"} |= "reason=database_error"
 ```
+
+### Structured logging
+
+Every API and worker log line is one JSON object with a fixed set of keys, so Grafana can filter, count and graph log fields instead of searching text.
+
+Example (a job that failed on its last attempt):
+
+```json
+{"ts": "2026-11-17T09:45:44.022+00:00", "level": "ERROR", "service": "worker", "logger": "taskpulse.worker",
+ "event": "job_failed", "message": "job failed permanently id=4b0ea9ae... reason=simulated error=Simulated failure while running generate_report",
+ "trace_id": "f8ae16e4c7e01c69a85e0fef752f6741", "job_id": "4b0ea9ae-...", "attempt": 4, "max_attempts": 4,
+ "job_type": "generate_report", "reason": "simulated", "error_type": "RuntimeError",
+ "error_message": "Simulated failure while running generate_report",
+ "duration_ms": 4012.5, "memory_rss_mb": 88.4, "memory_delta_mb": 0.3, "system_memory_percent": 21.0}
+```
+
+**Fixed keys on every line:** `ts` (UTC, ISO 8601), `level`, `service` (`api` or `worker`), `logger`, `event`, `message`, `trace_id`.
+
+**Added while something is running:** `request_id` and `client` during an API request; `job_id`, `job_type`, `attempt` and `max_attempts` during a job. Every line written in that time carries them, including lines from libraries.
+
+**Errors add:** `reason`, `error_type`, `error_message` (up to 500 characters) and, for unhandled errors and worker crashes, `stack` (up to 4000 characters).
+
+| Event | Service | Extra fields |
+|---|---|---|
+| `request_completed` | api | `method`, `path` (the route, such as `/jobs/{job_id}`), `status_code`, `duration_ms`, `process_rss_mb`, `system_memory_percent`, and `reason` for 404, 422, 429 and 5xx |
+| `request_failed` | api | an unhandled exception: error fields and `stack` |
+| `job_submitted`, `job_manual_retry` | api | `job_id`, `job_type` |
+| `queue_full` | api | `queue_depth`, `queue_limit` |
+| `enqueue_failed` | api | the job was saved but could not be queued: error fields |
+| `job_started` | worker | `memory_rss_mb`, `system_memory_percent` |
+| `job_retry_scheduled` | worker | error fields, `retry_in_seconds`, `duration_ms`, memory fields |
+| `job_failed` | worker | error fields, `duration_ms`, memory fields |
+| `job_succeeded` | worker | `duration_ms`, memory fields |
+| `job_crashed` | worker | the database, Redis or the machine failed (not the job): error fields, `stack`, memory fields |
+
+`reason` is always one word from a fixed list. Worker and system failures: `simulated`, `timeout`, `redis_error`, `database_error`, `network_error`, `out_of_memory`, `disk_full`, `code_error`, `unknown`. API answers: `not_found`, `invalid_request`, `rate_limited`, `server_error`, `queue_full`, `queue_unavailable`.
+
+**Who and how much memory**
+
+| Field | Meaning |
+|---|---|
+| `client` | `key:` plus the first 8 characters of the SHA-256 of the `X-API-Key`, or `ip:` plus the address when there is no key. The raw key is never logged. There are no user accounts, so this is the only caller identity. |
+| `process_rss_mb` / `memory_rss_mb` | RAM held by that process (the API or one worker process) |
+| `memory_delta_mb` | Change of the worker process's RAM during one job. Approximate: Python often keeps freed memory, so a small or zero change does not prove the job used no memory. |
+| `system_memory_percent` | Memory used on the whole machine. Inside Docker Desktop this is the Linux VM that runs all the containers. |
+
+Memory in an API log line belongs to the whole API process, because requests share it. It shows how much memory the API held while a client's request ran; it cannot say that this client used that memory.
+
+**Privacy.** Fields whose names contain `password`, `secret`, `token`, `authorization`, `api_key` or `cookie` are replaced with `[redacted]`. `/health` and `/metrics` requests are not logged.
+
+**Every response** carries an `X-Request-ID` header. A client can send its own, otherwise one is created. Use it to find every log line of one request.
+
+**Parser (Grafana Alloy).** Before a line is stored in Loki, Alloy reads the JSON, uses the line's own `ts` as the log time, and turns four fields with few different values into Loki labels: `level`, `event`, `reason` and `job_type`. Fields with many different values (`job_id`, `request_id`, `client`, `trace_id`) are not labels, because every new label value creates a new Loki stream; read them at query time with `| json`. Lines that are not JSON pass through unchanged. Uvicorn's own logs are written through the same JSON formatter, and `request_completed` replaces its access line.
+
+Useful queries (Grafana Explore, Loki):
+
+```
+{service="worker", event="job_failed"} | json
+{service="worker", reason="database_error"}
+{service="api", reason="rate_limited"} | json | line_format "{{.client}} {{.path}}"
+{service="api", event="request_completed"} | json | duration_ms > 500
+{service=~"api|worker"} | json | request_id="REQUEST-ID"
+sum by (reason) (count_over_time({service=~"api|worker", reason!=""}[5m]))
+avg by (job_type) (avg_over_time({service="worker", event="job_succeeded"} | json | unwrap memory_rss_mb | __error__="" [5m]))
+topk(5, sum by (client) (count_over_time({service="api", event="request_completed"} | json [5m])))
+```
+
+Code: `app/logging_config.py` (formatter and context fields), `app/request_logging.py` (API middleware), `app/resource_usage.py` (memory readings), `observability/alloy/config.alloy` (parser). Tests: `tests/test_logging_config.py`, `tests/test_request_logging.py`, `tests/test_task_failures.py`.
 
 ### Traces
 OpenTelemetry traces go to Tempo. One trace follows a job from the API, through the Redis queue, into the worker and the database.
@@ -247,7 +319,7 @@ If a job is saved but cannot be put on the queue (for example Redis is down), th
 
 Inside Docker Desktop, CPU and memory describe the Linux VM that runs all the containers. Memory and CPU of each process are also available as `process_resident_memory_bytes` and `process_cpu_seconds_total`.
 
-**Dashboard panels.** Failure attempts by reason, total failure attempts, enqueue failures, Redis and PostgreSQL health, CPU, memory and disk usage, job retry rate, and worker warning and error logs.
+**Dashboard panels.** Failure attempts by reason, total failure attempts, enqueue failures, Redis and PostgreSQL health, CPU, memory and disk usage, job retry rate, and worker warning and error logs. Panels built from the structured logs: failure reasons, last errors, memory per job type and top clients.
 
 ### Services
 | Service | URL |
@@ -327,6 +399,7 @@ Full write-up with timeline, root cause and action items: [docs/incident-report.
 ## Roadmap
 - "Stuck jobs" dashboard panel and alert (jobs in `running` or `pending` for more than 5 minutes)
 - Alerts on failure reasons and on dependency health
+- Alerts on error logs from Loki (for example repeated `database_error` lines)
 - Re-run the worker kill test after the visibility timeout fix, with a load below worker capacity
 - Make tasks safe to run twice (a recovered job can run again with `acks_late`)
 - Redis and PostgreSQL outage simulations

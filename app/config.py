@@ -15,6 +15,6 @@ class Settings(BaseSettings):
 
     failure_rate: float = 0.15
     extra_latency_seconds: float = 0.0
-
+    
 
 settings = Settings()
