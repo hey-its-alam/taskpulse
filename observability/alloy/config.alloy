@@ -1,3 +1,4 @@
+
 discovery.docker "containers" {
   host = "unix:///var/run/docker.sock"
 }
@@ -10,6 +11,7 @@ discovery.relabel "logs" {
     regex         = "/(.*)"
     target_label  = "container"
   }
+
   rule {
     source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
     target_label  = "service"
@@ -19,7 +21,74 @@ discovery.relabel "logs" {
 loki.source.docker "default" {
   host       = "unix:///var/run/docker.sock"
   targets    = discovery.relabel.logs.output
+  forward_to = [loki.process.parse.receiver]
+}
+
+loki.process "parse" {
   forward_to = [loki.write.default.receiver]
+
+  // Parse application JSON logs
+  stage.match {
+    selector = `{service=~".+"} |~ "^\\{"`
+
+    stage.json {
+      expressions = {
+        ts       = "ts",
+        level    = "level",
+        event    = "event",
+        reason   = "reason",
+        job_type = "job_type",
+      }
+    }
+
+    stage.timestamp {
+      source = "ts"
+      format = "RFC3339Nano"
+    }
+
+    stage.labels {
+      values = {
+        level    = "",
+        event    = "",
+        reason   = "",
+        job_type = "",
+      }
+    }
+
+    stage.structured_metadata {
+      values = {
+        job_id      = "job_id",
+        request_id  = "request_id",
+        trace_id    = "trace_id",
+        client      = "client",
+        duration_ms = "duration_ms",
+        memory_rss_mb = "memory_rss_mb",
+      }
+    }
+  }
+
+  // Parse Uvicorn plain-text access logs
+  stage.match {
+    selector = `{service="api"} !~ "^\\{"`
+
+    stage.regex {
+      expression = `^(?P<level>INFO|WARNING|ERROR):\s+[^ ]+ - "(?P<method>[A-Z]+) (?P<path>[^ ]+) HTTP/[^"]+" (?P<status_code>[0-9]{3})`
+    }
+
+    stage.labels {
+      values = {
+        level = "level",
+      }
+    }
+
+    stage.structured_metadata {
+      values = {
+        method      = "method",
+        path        = "path",
+        status_code = "status_code",
+      }
+    }
+  }
 }
 
 loki.write "default" {

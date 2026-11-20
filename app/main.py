@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from .request_logging import RequestLoggingMiddleware
 
 from fastapi import FastAPI
 from prometheus_fastapi_instrumentator import Instrumentator
@@ -21,6 +22,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="TaskPulse", version="0.7.0", lifespan=lifespan)
+app.add_middleware(RequestLoggingMiddleware)
 instrument_fastapi(app)
 Instrumentator().instrument(app).expose(app, include_in_schema=False)
 register_db_collector()
